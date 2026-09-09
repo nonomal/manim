@@ -1,14 +1,43 @@
 Installation
 ============
 
-Manim runs on Python 3.6 or higher (Python 3.8 is recommended).
+Manim runs on Python 3.10 or higher.
 
-System requirements are：
+System requirements are:
 
 - `FFmpeg <https://ffmpeg.org/>`__
-- `OpenGL <https://www.opengl.org//>`__ (included in python package ``PyOpenGL``)
+- `OpenGL <https://www.opengl.org/>`__ (included in python package ``PyOpenGL``)
 - `LaTeX <https://www.latex-project.org>`__ (optional, if you want to use LaTeX)
 - `Pango <https://pango.org>`__ (only for Linux)
+
+
+Install FFmpeg
+--------------
+
+Follow the instructions for your platform, then run ``ffmpeg -version`` to check
+that the installation succeeded.
+
+Windows
+^^^^^^^
+
+.. code-block:: bat
+
+   choco install ffmpeg
+
+Linux
+^^^^^
+
+.. code-block:: sh
+
+   sudo apt update
+   sudo apt install ffmpeg
+
+macOS
+^^^^^
+
+.. code-block:: sh
+
+   brew install ffmpeg
 
 
 Directly
@@ -35,7 +64,7 @@ that directory execute:
    # or
    manim-render example_scenes.py OpeningManimExample
 
-If you run the above command and no error message appears, 
+If you run the above command and no error message appears,
 then you have successfully installed all the environments required by manim.
 
 Directly (Windows)
@@ -47,23 +76,23 @@ Directly (Windows)
    `TeXLive-full <http://tug.org/texlive/>`__ is recommended.
 3. Install the remaining Python packages.
 
-.. code-block:: sh  
+.. code-block:: sh
 
    git clone https://github.com/3b1b/manim.git
-   cd manim  
-   pip install -e . 
+   cd manim
+   pip install -e .
    manimgl example_scenes.py OpeningManimExample
 
 For Anaconda
 ------------
 
 -  Install FFmpeg and LaTeX as above.
--  Create a conda environment using
+-  Clone the repository and set up the environment using
 
 .. code-block:: sh
-   
+
    git clone https://github.com/3b1b/manim.git
-   cd manim 
-   conda create -n manim python=3.8
+   cd manim
+   conda create -n manim python=3.10
    conda activate manim
    pip install -e .

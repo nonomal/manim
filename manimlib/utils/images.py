@@ -1,12 +1,20 @@
+from __future__ import annotations
+
 import numpy as np
 from PIL import Image
 
-from manimlib.utils.file_ops import find_file
 from manimlib.utils.directories import get_raster_image_dir
 from manimlib.utils.directories import get_vector_image_dir
+from manimlib.utils.directories import get_three_d_model_dir
+from manimlib.utils.file_ops import find_file
+
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from typing import Iterable
 
 
-def get_full_raster_image_path(image_file_name):
+def get_full_raster_image_path(image_file_name: str) -> str:
     return find_file(
         image_file_name,
         directories=[get_raster_image_dir()],
@@ -14,7 +22,15 @@ def get_full_raster_image_path(image_file_name):
     )
 
 
-def get_full_vector_image_path(image_file_name):
+def get_full_video_path(video_file_name: str) -> str:
+    return find_file(
+        video_file_name,
+        directories=[get_raster_image_dir()],
+        extensions=[".mp4", ".mov", ".webm", ".gif", ".mkv", ".avi", ""]
+    )
+
+
+def get_full_vector_image_path(image_file_name: str) -> str:
     return find_file(
         image_file_name,
         directories=[get_vector_image_dir()],
@@ -22,16 +38,15 @@ def get_full_vector_image_path(image_file_name):
     )
 
 
-def drag_pixels(frames):
-    curr = frames[0]
-    new_frames = []
-    for frame in frames:
-        curr += (curr == 0) * np.array(frame)
-        new_frames.append(np.array(curr))
-    return new_frames
+def get_full_three_d_model_path(model_file_name: str) -> str:
+    return find_file(
+        model_file_name,
+        directories=[get_three_d_model_dir()],
+        extensions=[".obj", ""],
+    )
 
 
-def invert_image(image):
+def invert_image(image: Iterable) -> Image.Image:
     arr = np.array(image)
     arr = (255 * np.ones(arr.shape)).astype(arr.dtype) - arr
     return Image.fromarray(arr)

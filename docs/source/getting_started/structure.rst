@@ -96,13 +96,13 @@ Below is the directory structure of manim:
     └── utils/ # Some useful utility functions
         ├── bezier.py             # For bezier curve
         ├── color.py              # For color
-        ├── config_ops.py         # Process CONFIG
+        ├── dict_ops.py           # Functions related to dictionary processing
         ├── customization.py      # Read from custom_config.yml
         ├── debug.py              # Utilities for debugging in program
+        ├── directories.py        # Read directories from config file
         ├── family_ops.py         # Process family members
         ├── file_ops.py           # Process files and directories
         ├── images.py             # Read image
-        ├── init_config.py        # Configuration guide
         ├── iterables.py          # Functions related to list/dictionary processing
         ├── paths.py              # Curve path
         ├── rate_functions.py     # Some defined rate_functions
@@ -119,9 +119,9 @@ Inheritance structure of manim's classes
 is a pdf showed inheritance structure of manim's classes, large, 
 but basically all classes have included:
 
-.. image:: ../_static/manim_shaders_structure.png
+.. image:: https://cdn.jsdelivr.net/gh/manim-kindergarten/CDN@master/manimgl_assets/manim_shaders_structure.png
 
 Manim execution process
 -----------------------
 
-.. image:: ../_static/manim_shaders_process_en.png
+.. image:: https://cdn.jsdelivr.net/gh/manim-kindergarten/CDN@master/manimgl_assets/manim_shaders_process_en.png

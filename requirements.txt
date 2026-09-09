@@ -1,19 +1,31 @@
-argparse
+addict
+appdirs
+audioop-lts; python_version>='3.13'
+av
 colour
+diskcache
+ipython>=8.18.0
+isosurfaces
+fontTools
+glfw
+manimpango>=0.6.0
+matplotlib
 numpy
 Pillow
-scipy
-sympy
-tqdm
-mapbox-earcut
-matplotlib
-moderngl
-moderngl_window
 pydub
+pygments
+pyperclip
+pywavefront
 pyyaml
-screeninfo
-pyreadline; sys_platform == 'win32'
+rendercanvas
+rich
+scipy
+setuptools
+skia-pathops
+svgelements>=1.8.1
+sympy
+trimesh
+tqdm
+typing-extensions; python_version < "3.11"
 validators
-ipython
-PyOpenGL
-manimpango>=0.2.0,<0.4.0
+wgpu

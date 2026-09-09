@@ -1,473 +1,358 @@
-import moderngl
-from colour import Color
-import OpenGL.GL as gl
+from __future__ import annotations
 
-from PIL import Image
+from contextlib import contextmanager
+
 import numpy as np
-import itertools as it
+import wgpu
+from PIL import Image
 
-from manimlib.constants import *
+from manimlib.camera.camera_frame import CameraFrame
+from manimlib.constants import BLACK
+from manimlib.constants import DEFAULT_RESOLUTION
+from manimlib.constants import FRAME_HEIGHT
+from manimlib.constants import FRAME_WIDTH
 from manimlib.mobject.mobject import Mobject
 from manimlib.mobject.mobject import Point
-from manimlib.utils.config_ops import digest_config
-from manimlib.utils.simple_functions import fdiv
-from manimlib.utils.simple_functions import clip
-from manimlib.utils.space_ops import angle_of_vector
-from manimlib.utils.space_ops import rotation_matrix_transpose_from_quaternion
-from manimlib.utils.space_ops import rotation_matrix_transpose
-from manimlib.utils.space_ops import quaternion_from_angle_axis
-from manimlib.utils.space_ops import quaternion_mult
+from manimlib.renderer.gpu import Gpu
+from manimlib.renderer.pipeline import COLOR_FORMAT
+from manimlib.renderer.pipeline import DEPTH_STENCIL_FORMAT
+from manimlib.renderer.renderer import Renderer
+from manimlib.utils.color import color_to_rgba
+
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from typing import Optional
+    from manimlib.typing import ManimColor, Vect3
+    from manimlib.window import Window
 
 
-class CameraFrame(Mobject):
-    CONFIG = {
-        "frame_shape": (FRAME_WIDTH, FRAME_HEIGHT),
-        "center_point": ORIGIN,
-        # Theta, phi, gamma
-        "euler_angles": [0, 0, 0],
-        "focal_distance": 2,
-    }
+class FrameStream(object):
+    """
+    Frames off the gpu and into somewhere they are being written, staying a frame behind so
+    that the copy of one happens while the next is being drawn.
 
-    def init_data(self):
-        super().init_data()
-        self.data["euler_angles"] = np.array(self.euler_angles, dtype=float)
-        self.refresh_rotation_matrix()
+    Getting a frame back means copying the texture into a buffer the cpu can read, which the
+    gpu cannot do until it has finished drawing, so asking and reading in one breath waits, as
+    Camera.get_frame_bytes does. Here the copy is only asked for, and what gets written is the
+    frame before it, whose copy has had a whole frame's drawing to finish.
 
-    def init_points(self):
-        self.set_points([ORIGIN, LEFT, RIGHT, DOWN, UP])
-        self.set_width(self.frame_shape[0], stretch=True)
-        self.set_height(self.frame_shape[1], stretch=True)
-        self.move_to(self.center_point)
+    Frames still go to the same place in the same order. Whoever is writing them has only to
+    drain what is in flight before closing, see SceneFileWriter.close_movie_pipe.
+    """
 
-    def to_default_state(self):
-        self.center()
-        self.set_height(FRAME_HEIGHT)
-        self.set_width(FRAME_WIDTH)
-        self.set_euler_angles(0, 0, 0)
-        return self
+    def __init__(self, camera: Camera, sink, behind: int = 1):
+        self.camera = camera
+        self.sink = sink
+        self.behind = behind
+        self.device = camera.gpu.device
+        self.queue = camera.gpu.queue
+        # Settled here rather than read afresh, since whatever is being written was opened
+        # expecting frames of one size
+        self.width, self.height = camera.get_pixel_shape()
+        self.row = 4 * self.width
+        # A texture copy leaves each row a multiple of 256 bytes from the next, so rows come
+        # back with padding on the end of them unless the width happens to suit
+        self.padded_row = self.row + (-self.row % 256)
+        # One buffer per frame in flight and one more to be copying into, which is what being
+        # a frame behind costs: a frame's worth of memory each, so 33MB apiece at 4k
+        self.buffers = [
+            self.device.create_buffer(
+                size=self.padded_row * self.height,
+                usage=wgpu.BufferUsage.COPY_DST | wgpu.BufferUsage.MAP_READ,
+            )
+            for _ in range(behind + 1)
+        ]
+        # Which buffers are waiting to be read, oldest first, and how many have been asked
+        # for, counted so that no buffer receives a copy while still mapped from an earlier
+        # frame
+        self.waiting: list = []
+        self.asked = 0
 
-    def get_euler_angles(self):
-        return self.data["euler_angles"]
-
-    def get_inverse_camera_rotation_matrix(self):
-        return self.inverse_camera_rotation_matrix
-
-    def refresh_rotation_matrix(self):
-        # Rotate based on camera orientation
-        theta, phi, gamma = self.get_euler_angles()
-        quat = quaternion_mult(
-            quaternion_from_angle_axis(theta, OUT, axis_normalized=True),
-            quaternion_from_angle_axis(phi, RIGHT, axis_normalized=True),
-            quaternion_from_angle_axis(gamma, OUT, axis_normalized=True),
+    def send(self) -> None:
+        """Asks for the frame as it stands, and writes whichever one is ready"""
+        buffer = self.buffers[self.asked % len(self.buffers)]
+        self.asked += 1
+        encoder = self.device.create_command_encoder()
+        encoder.copy_texture_to_buffer(
+            {"texture": self.camera.color_texture, "mip_level": 0, "origin": (0, 0, 0)},
+            {"buffer": buffer, "offset": 0,
+             "bytes_per_row": self.padded_row, "rows_per_image": self.height},
+            (self.width, self.height, 1),
         )
-        self.inverse_camera_rotation_matrix = rotation_matrix_transpose_from_quaternion(quat)
+        self.queue.submit([encoder.finish()])
+        self.waiting.append((buffer, buffer.map_async("READ", 0, buffer.size)))
+        if len(self.waiting) > self.behind:
+            self.write_oldest()
 
-    def rotate(self, angle, axis=OUT, **kwargs):
-        curr_rot_T = self.get_inverse_camera_rotation_matrix()
-        added_rot_T = rotation_matrix_transpose(angle, axis)
-        new_rot_T = np.dot(curr_rot_T, added_rot_T)
-        Fz = new_rot_T[2]
-        phi = np.arccos(Fz[2])
-        theta = angle_of_vector(Fz[:2]) + PI / 2
-        partial_rot_T = np.dot(
-            rotation_matrix_transpose(phi, RIGHT),
-            rotation_matrix_transpose(theta, OUT),
-        )
-        gamma = angle_of_vector(np.dot(partial_rot_T, new_rot_T.T)[:, 0])
-        self.set_euler_angles(theta, phi, gamma)
-        return self
-
-    def set_euler_angles(self, theta=None, phi=None, gamma=None, units=RADIANS):
-        if theta is not None:
-            self.data["euler_angles"][0] = theta * units
-        if phi is not None:
-            self.data["euler_angles"][1] = phi * units
-        if gamma is not None:
-            self.data["euler_angles"][2] = gamma * units
-        self.refresh_rotation_matrix()
-        return self
-
-    def reorient(self, theta_degrees=None, phi_degrees=None, gamma_degrees=None):
+    def drain(self) -> None:
         """
-        Shortcut for set_euler_angles, defaulting to taking
-        in angles in degrees
+        Writes every frame still in flight. Whatever is being written to has to be told this
+        before it is closed, or the last frames of it are the ones which never arrive.
         """
-        self.set_euler_angles(theta_degrees, phi_degrees, gamma_degrees, units=DEGREES)
-        return self
+        while self.waiting:
+            self.write_oldest()
 
-    def set_theta(self, theta):
-        return self.set_euler_angles(theta=theta)
-
-    def set_phi(self, phi):
-        return self.set_euler_angles(phi=phi)
-
-    def set_gamma(self, gamma):
-        return self.set_euler_angles(gamma=gamma)
-
-    def increment_theta(self, dtheta):
-        self.data["euler_angles"][0] += dtheta
-        self.refresh_rotation_matrix()
-        return self
-
-    def increment_phi(self, dphi):
-        phi = self.data["euler_angles"][1]
-        new_phi = clip(phi + dphi, 0, PI)
-        self.data["euler_angles"][1] = new_phi
-        self.refresh_rotation_matrix()
-        return self
-
-    def increment_gamma(self, dgamma):
-        self.data["euler_angles"][2] += dgamma
-        self.refresh_rotation_matrix()
-        return self
-
-    def get_shape(self):
-        return (self.get_width(), self.get_height())
-
-    def get_center(self):
-        # Assumes first point is at the center
-        return self.get_points()[0]
-
-    def get_width(self):
-        points = self.get_points()
-        return points[2, 0] - points[1, 0]
-
-    def get_height(self):
-        points = self.get_points()
-        return points[4, 1] - points[3, 1]
-
-    def get_focal_distance(self):
-        return self.focal_distance * self.get_height()
-
-    def interpolate(self, *args, **kwargs):
-        super().interpolate(*args, **kwargs)
-        self.refresh_rotation_matrix()
+    def write_oldest(self) -> None:
+        buffer, promise = self.waiting.pop(0)
+        promise.sync_wait()
+        frame = buffer.read_mapped(copy=False)
+        if self.padded_row > self.row:
+            rows = np.frombuffer(frame, np.uint8).reshape((self.height, self.padded_row))
+            frame = rows[:, :self.row].tobytes()
+        self.sink.write(frame)
+        # What was read is a view onto the buffer, so it is done with before the buffer is
+        buffer.unmap()
 
 
 class Camera(object):
-    CONFIG = {
-        "background_image": None,
-        "frame_config": {},
-        "pixel_width": DEFAULT_PIXEL_WIDTH,
-        "pixel_height": DEFAULT_PIXEL_HEIGHT,
-        "frame_rate": DEFAULT_FRAME_RATE,
-        # Note: frame height and width will be resized to match
-        # the pixel aspect ratio
-        "background_color": BLACK,
-        "background_opacity": 1,
-        # Points in vectorized mobjects with norm greater
-        # than this value will be rescaled.
-        "max_allowable_norm": FRAME_WIDTH,
-        "image_mode": "RGBA",
-        "n_channels": 4,
-        "pixel_array_dtype": 'uint8',
-        "light_source_position": [-10, 10, 10],
-        # Measured in pixel widths, used for vector graphics
-        "anti_alias_width": 1.5,
+    def __init__(
+        self,
+        window: Optional[Window] = None,
+        frame_config: dict = dict(),
+        # Note: frame height and width will be resized to match this resolution aspect ratio
+        resolution=DEFAULT_RESOLUTION,
+        fps: int = 30,
+        background_color: ManimColor = BLACK,
+        background_opacity: float = 1.0,
+        light_source_position: Vect3 = np.array([-10, 10, 10]),
+        bundle_draws: bool = True,
+        draw_together: bool = True,
         # Although vector graphics handle antialiasing fine
         # without multisampling, for 3d scenes one might want
         # to set samples to be greater than 0.
-        "samples": 0,
-    }
+        samples: int = 0,
+    ):
+        self.window = window
+        self.default_pixel_shape = resolution  # Rename?
+        self.fps = fps
+        self.light_source_position = light_source_position
+        self.samples = samples
+        self.bundle_draws = bundle_draws
+        self.draw_together = draw_together
 
-    def __init__(self, ctx=None, **kwargs):
-        digest_config(self, kwargs, locals())
-        self.rgb_max_val = np.iinfo(self.pixel_array_dtype).max
-        self.background_rgba = [
-            *Color(self.background_color).get_rgb(),
-            self.background_opacity
-        ]
-        self.init_frame()
-        self.init_context(ctx)
-        self.init_shaders()
-        self.init_textures()
+        self.background_rgba: list[float] = list(color_to_rgba(
+            background_color, background_opacity
+        ))
+        # Where a window is showing the scene, frames are drawn at its size rather than at
+        # the resolution they are written at, since drawing 4k to shrink into a small window
+        # costs more than it shows. See at_output_resolution for the exception.
+        self.draw_at_window_size = window is not None
+        self.pixel_shape = (0, 0)
+        self.init_frame(**frame_config)
+        self.init_renderer()
+        self.init_target()
         self.init_light_source()
-        self.refresh_perspective_uniforms()
-        self.static_mobject_to_render_group_list = {}
 
-    def init_frame(self):
-        self.frame = CameraFrame(**self.frame_config)
+    def init_frame(self, **config) -> None:
+        self.frame = CameraFrame(**config)
 
-    def init_context(self, ctx=None):
-        if ctx is None:
-            ctx = moderngl.create_standalone_context()
-            fbo = self.get_fbo(ctx, 0)
-        else:
-            fbo = ctx.detect_framebuffer()
-
-        # For multisample antialiasing
-        fbo_msaa = self.get_fbo(ctx, self.samples)
-        fbo_msaa.use()
-
-        ctx.enable(moderngl.BLEND)
-        ctx.blend_func = (
-            moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA,
-            moderngl.ONE, moderngl.ONE
+    def init_renderer(self) -> None:
+        # A window's surface can be configured for one device only, so a scene shown in one
+        # draws through the device it already holds rather than bringing another, see
+        # Window.configure. That also spares every scene after the first the compiling of
+        # every pipeline again, those being kept on the device.
+        self.gpu = Gpu() if self.window is None else self.window.gpu
+        self.renderer = Renderer(
+            self.gpu, bundle=self.bundle_draws, together=self.draw_together,
         )
 
-        self.ctx = ctx
-        self.fbo = fbo
-        self.fbo_msaa = fbo_msaa
+    def get_target_shape(self) -> tuple[int, int]:
+        if self.draw_at_window_size and self.window is not None:
+            return self.window.get_size()
+        return self.default_pixel_shape
 
-    def init_light_source(self):
+    def resize_target(self) -> None:
+        """
+        Makes what a frame is drawn into the size it ought to be, which changes when the
+        window is resized or when a frame is wanted at the resolution it will be written at.
+        """
+        if self.get_target_shape() != self.pixel_shape:
+            self.init_target()
+
+    @contextmanager
+    def at_output_resolution(self):
+        """
+        Draws at the resolution frames are written at rather than at the window's size, for
+        as long as the block lasts. Without a window the two are already the same.
+
+        The target is resized here rather than at the next capture, since whatever the block
+        does may well ask how big a frame is before drawing one, as opening a movie pipe does.
+        """
+        was_at_window_size = self.draw_at_window_size
+        self.draw_at_window_size = False
+        self.resize_target()
+        try:
+            yield
+        finally:
+            self.draw_at_window_size = was_at_window_size
+            self.resize_target()
+
+    def init_target(self) -> None:
+        """
+        What every frame is drawn into: one color texture and one depth-stencil texture. Where
+        samples are being taken there is a second color texture holding them, which the first
+        is resolved down to.
+        """
+        device = self.gpu.device
+        self.pixel_shape = self.get_target_shape()
+        width, height = self.pixel_shape
+        samples = self.gpu.samples = max(1, self.samples)
+
+        self.color_texture = device.create_texture(
+            size=(width, height, 1),
+            format=COLOR_FORMAT,
+            usage=(
+                wgpu.TextureUsage.RENDER_ATTACHMENT
+                | wgpu.TextureUsage.COPY_SRC
+                | wgpu.TextureUsage.TEXTURE_BINDING
+            ),
+        )
+        self.multisample_texture = None
+        if samples > 1:
+            self.multisample_texture = device.create_texture(
+                size=(width, height, 1),
+                format=COLOR_FORMAT,
+                usage=wgpu.TextureUsage.RENDER_ATTACHMENT,
+                sample_count=samples,
+            )
+        self.depth_stencil_texture = device.create_texture(
+            size=(width, height, 1),
+            format=DEPTH_STENCIL_FORMAT,
+            usage=wgpu.TextureUsage.RENDER_ATTACHMENT,
+            sample_count=samples,
+        )
+
+        # A view onto a texture is the same every frame, so they are made along with it
+        drawn_into = self.multisample_texture or self.color_texture
+        self.color_view = drawn_into.create_view()
+        self.resolve_view = self.color_texture.create_view() if samples > 1 else None
+        self.depth_stencil_view = self.depth_stencil_texture.create_view()
+        # What a finished frame is read from, which is where samples end up rather than
+        # where they are taken
+        self.frame_view = self.color_texture.create_view()
+
+    def init_light_source(self) -> None:
         self.light_source = Point(self.light_source_position)
 
-    # Methods associated with the frame buffer
-    def get_fbo(self, ctx, samples=0):
-        pw = self.pixel_width
-        ph = self.pixel_height
-        return ctx.framebuffer(
-            color_attachments=ctx.texture(
-                (pw, ph),
-                components=self.n_channels,
-                samples=samples,
-            ),
-            depth_attachment=ctx.depth_renderbuffer(
-                (pw, ph),
-                samples=samples
-            )
+    def get_attachments(self) -> dict:
+        """
+        The textures a frame is drawn into, and what to do with what they already hold.
+        Beginning the pass is what clears them.
+        """
+        return {
+            "color_attachments": [{
+                "view": self.color_view,
+                "resolve_target": self.resolve_view,
+                "clear_value": tuple(self.background_rgba),
+                "load_op": wgpu.LoadOp.clear,
+                "store_op": wgpu.StoreOp.store,
+            }],
+            "depth_stencil_attachment": {
+                "view": self.depth_stencil_view,
+                "depth_clear_value": 1.0,
+                "depth_load_op": wgpu.LoadOp.clear,
+                "depth_store_op": wgpu.StoreOp.store,
+                "stencil_clear_value": 0,
+                "stencil_load_op": wgpu.LoadOp.clear,
+                "stencil_store_op": wgpu.StoreOp.store,
+            },
+        }
+
+    def get_frame_bytes(self) -> memoryview:
+        """
+        The frame as it stands, four bytes to a pixel, a row at a time from the top, as a view
+        onto what came off the gpu rather than a copy of it.
+        """
+        width, height = self.pixel_shape
+        return self.gpu.queue.read_texture(
+            {"texture": self.color_texture, "mip_level": 0, "origin": (0, 0, 0)},
+            {"offset": 0, "bytes_per_row": 4 * width, "rows_per_image": height},
+            (width, height, 1),
         )
 
-    def clear(self):
-        self.fbo.clear(*self.background_rgba)
-        self.fbo_msaa.clear(*self.background_rgba)
-
-    def reset_pixel_shape(self, new_width, new_height):
-        self.pixel_width = new_width
-        self.pixel_height = new_height
-        self.refresh_perspective_uniforms()
-
-    def get_raw_fbo_data(self, dtype='f1'):
-        # Copy blocks from the fbo_msaa to the drawn fbo using Blit
-        pw, ph = (self.pixel_width, self.pixel_height)
-        gl.glBindFramebuffer(gl.GL_READ_FRAMEBUFFER, self.fbo_msaa.glo)
-        gl.glBindFramebuffer(gl.GL_DRAW_FRAMEBUFFER, self.fbo.glo)
-        gl.glBlitFramebuffer(0, 0, pw, ph, 0, 0, pw, ph, gl.GL_COLOR_BUFFER_BIT, gl.GL_LINEAR)
-        return self.fbo.read(
-            viewport=self.fbo.viewport,
-            components=self.n_channels,
-            dtype=dtype,
-        )
-
-    def get_image(self, pixel_array=None):
-        return Image.frombytes(
-            'RGBA',
-            self.get_pixel_shape(),
-            self.get_raw_fbo_data(),
-            'raw', 'RGBA', 0, -1
-        )
-
-    def get_pixel_array(self):
-        raw = self.get_raw_fbo_data(dtype='f4')
-        flat_arr = np.frombuffer(raw, dtype='f4')
-        arr = flat_arr.reshape([*self.fbo.size, self.n_channels])
-        # Convert from float
-        return (self.rgb_max_val * arr).astype(self.pixel_array_dtype)
-
-    # Needed?
-    def get_texture(self):
-        texture = self.ctx.texture(
-            size=self.fbo.size,
-            components=4,
-            data=self.get_raw_fbo_data(),
-            dtype='f4'
-        )
-        return texture
+    def get_image(self) -> Image.Image:
+        return Image.frombytes("RGBA", self.pixel_shape, self.get_frame_bytes())
 
     # Getting camera attributes
-    def get_pixel_shape(self):
-        return self.fbo.viewport[2:4]
-        # return (self.pixel_width, self.pixel_height)
+    def get_pixel_size(self) -> float:
+        return self.frame.get_width() / self.get_pixel_shape()[0]
 
-    def get_pixel_width(self):
+    def get_pixel_shape(self) -> tuple[int, int]:
+        return self.pixel_shape
+
+    def get_pixel_width(self) -> int:
         return self.get_pixel_shape()[0]
 
-    def get_pixel_height(self):
+    def get_pixel_height(self) -> int:
         return self.get_pixel_shape()[1]
 
-    def get_frame_height(self):
+    def get_aspect_ratio(self):
+        pw, ph = self.get_pixel_shape()
+        return pw / ph
+
+    def get_frame_height(self) -> float:
         return self.frame.get_height()
 
-    def get_frame_width(self):
+    def get_frame_width(self) -> float:
         return self.frame.get_width()
 
-    def get_frame_shape(self):
+    def get_frame_shape(self) -> tuple[float, float]:
         return (self.get_frame_width(), self.get_frame_height())
 
-    def get_frame_center(self):
+    def get_frame_center(self) -> np.ndarray:
         return self.frame.get_center()
 
-    def resize_frame_shape(self, fixed_dimension=0):
+    def get_location(self) -> tuple[float, float, float]:
+        return self.frame.get_implied_camera_location()
+
+    def resize_frame_shape(self, fixed_dimension: bool = False) -> None:
         """
         Changes frame_shape to match the aspect ratio
         of the pixels, where fixed_dimension determines
         whether frame_height or frame_width
         remains fixed while the other changes accordingly.
         """
-        pixel_height = self.get_pixel_height()
-        pixel_width = self.get_pixel_width()
         frame_height = self.get_frame_height()
         frame_width = self.get_frame_width()
-        aspect_ratio = fdiv(pixel_width, pixel_height)
-        if fixed_dimension == 0:
+        aspect_ratio = self.get_aspect_ratio()
+        if not fixed_dimension:
             frame_height = frame_width / aspect_ratio
         else:
             frame_width = aspect_ratio * frame_height
-        self.frame.set_height(frame_height)
-        self.frame.set_width(frame_width)
-
-    def pixel_coords_to_space_coords(self, px, py, relative=False):
-        pw, ph = self.fbo.size
-        fw, fh = self.get_frame_shape()
-        fc = self.get_frame_center()
-        if relative:
-            return 2 * np.array([px / pw, py / ph, 0])
-        else:
-            # Only scale wrt one axis
-            scale = fh / ph
-            return fc + scale * np.array([(px - pw / 2), (py - ph / 2), 0])
+        self.frame.set_height(frame_height, stretch=True)
+        self.frame.set_width(frame_width, stretch=True)
 
     # Rendering
-    def capture(self, *mobjects, **kwargs):
-        self.refresh_perspective_uniforms()
-        for mobject in mobjects:
-            for render_group in self.get_render_group_list(mobject):
-                self.render(render_group)
+    def capture(self, *mobjects: Mobject) -> None:
+        self.resize_target()
+        self.refresh_uniforms()
+        self.gpu.send_frame_uniforms()
+        self.renderer.draw(mobjects, self.get_attachments())
+        if self.window is not None:
+            self.window.show(self.frame_view)
 
-    def render(self, render_group):
-        shader_wrapper = render_group["shader_wrapper"]
-        shader_program = render_group["prog"]
-        self.set_shader_uniforms(shader_program, shader_wrapper)
-        self.update_depth_test(shader_wrapper)
-        render_group["vao"].render(int(shader_wrapper.render_primitive))
-        if render_group["single_use"]:
-            self.release_render_group(render_group)
-
-    def update_depth_test(self, shader_wrapper):
-        if shader_wrapper.depth_test:
-            self.ctx.enable(moderngl.DEPTH_TEST)
-        else:
-            self.ctx.disable(moderngl.DEPTH_TEST)
-
-    def get_render_group_list(self, mobject):
-        try:
-            return self.static_mobject_to_render_group_list[id(mobject)]
-        except KeyError:
-            return map(self.get_render_group, mobject.get_shader_wrapper_list())
-
-    def get_render_group(self, shader_wrapper, single_use=True):
-        # Data buffers
-        vbo = self.ctx.buffer(shader_wrapper.vert_data.tobytes())
-        if shader_wrapper.vert_indices is None:
-            ibo = None
-        else:
-            vert_index_data = shader_wrapper.vert_indices.astype('i4').tobytes()
-            if vert_index_data:
-                ibo = self.ctx.buffer(vert_index_data)
-            else:
-                ibo = None
-
-        # Program and vertex array
-        shader_program, vert_format = self.get_shader_program(shader_wrapper)
-        vao = self.ctx.vertex_array(
-            program=shader_program,
-            content=[(vbo, vert_format, *shader_wrapper.vert_attributes)],
-            index_buffer=ibo,
-        )
-        return {
-            "vbo": vbo,
-            "ibo": ibo,
-            "vao": vao,
-            "prog": shader_program,
-            "shader_wrapper": shader_wrapper,
-            "single_use": single_use,
-        }
-
-    def release_render_group(self, render_group):
-        for key in ["vbo", "ibo", "vao"]:
-            if render_group[key] is not None:
-                render_group[key].release()
-
-    def set_mobjects_as_static(self, *mobjects):
-        # Creates buffer and array objects holding each mobjects shader data
-        for mob in mobjects:
-            self.static_mobject_to_render_group_list[id(mob)] = [
-                self.get_render_group(sw, single_use=False)
-                for sw in mob.get_shader_wrapper_list()
-            ]
-
-    def release_static_mobjects(self):
-        for rg_list in self.static_mobject_to_render_group_list.values():
-            for render_group in rg_list:
-                self.release_render_group(render_group)
-        self.static_mobject_to_render_group_list = {}
-
-    # Shaders
-    def init_shaders(self):
-        # Initialize with the null id going to None
-        self.id_to_shader_program = {"": None}
-
-    def get_shader_program(self, shader_wrapper):
-        sid = shader_wrapper.get_program_id()
-        if sid not in self.id_to_shader_program:
-            # Create shader program for the first time, then cache
-            # in the id_to_shader_program dictionary
-            program = self.ctx.program(**shader_wrapper.get_program_code())
-            vert_format = moderngl.detect_format(program, shader_wrapper.vert_attributes)
-            self.id_to_shader_program[sid] = (program, vert_format)
-        return self.id_to_shader_program[sid]
-
-    def set_shader_uniforms(self, shader, shader_wrapper):
-        for name, path in shader_wrapper.texture_paths.items():
-            tid = self.get_texture_id(path)
-            shader[name].value = tid
-        for name, value in it.chain(shader_wrapper.uniforms.items(), self.perspective_uniforms.items()):
-            try:
-                shader[name].value = value
-            except KeyError:
-                pass
-
-    def refresh_perspective_uniforms(self):
+    def refresh_uniforms(self) -> None:
+        """
+        What every shader reads about where the frame, the camera and the light are,
+        written into the block they all share, see Gpu.
+        """
         frame = self.frame
-        pw, ph = self.get_pixel_shape()
-        fw, fh = frame.get_shape()
-        # TODO, this should probably be a mobject uniform, with
-        # the camera taking care of the conversion factor
-        anti_alias_width = self.anti_alias_width / (ph / fh)
-        # Orient light
-        rotation = frame.get_inverse_camera_rotation_matrix()
-        light_pos = self.light_source.get_location()
-        light_pos = np.dot(rotation, light_pos)
-
-        self.perspective_uniforms = {
-            "frame_shape": frame.get_shape(),
-            "anti_alias_width": anti_alias_width,
-            "camera_center": tuple(frame.get_center()),
-            "camera_rotation": tuple(np.array(rotation).T.flatten()),
-            "light_source_position": tuple(light_pos),
-            "focal_distance": frame.get_focal_distance(),
-        }
-
-    def init_textures(self):
-        self.path_to_texture_id = {}
-
-    def get_texture_id(self, path):
-        if path not in self.path_to_texture_id:
-            # A way to increase tid's sequentially
-            tid = len(self.path_to_texture_id)
-            im = Image.open(path)
-            texture = self.ctx.texture(
-                size=im.size,
-                components=len(im.getbands()),
-                data=im.tobytes(),
-            )
-            texture.use(location=tid)
-            self.path_to_texture_id[path] = tid
-        return self.path_to_texture_id[path]
+        self.gpu.frame_uniforms.update(
+            view=frame.get_view_matrix().T.flatten(),
+            frame_scale=frame.get_scale(),
+            frame_rescale_factors=(
+                2.0 / FRAME_WIDTH,
+                2.0 / FRAME_HEIGHT,
+                frame.get_scale() / frame.get_focal_distance(),
+            ),
+            pixel_size=self.get_pixel_size(),
+            camera_position=frame.get_implied_camera_location(),
+            light_position=self.light_source.get_location(),
+        )
 
 
 # Mostly just defined so old scenes don't break
 class ThreeDCamera(Camera):
-    CONFIG = {
-        "samples": 4,
-    }
+    def __init__(self, samples: int = 4, **kwargs):
+        super().__init__(samples=samples, **kwargs)

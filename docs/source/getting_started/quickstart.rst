@@ -1,6 +1,13 @@
 Quick Start
 ===========
 
+This quick start is for ManimGL, the OpenGL-based version maintained in
+`3b1b/manim <https://github.com/3b1b/manim>`_. If you are looking for the
+Community Edition, install and follow the docs from
+`ManimCommunity/manim <https://github.com/ManimCommunity/manim>`_ instead.
+The two projects use different package names and setup instructions, so choose
+the version you want before installing dependencies or copying examples.
+
 After installing the manim environment according to the instructions on the
 :doc:`installation` page, you can try to make a scene yourself from scratch.
 
@@ -59,7 +66,7 @@ At this time, no window will pop up. When the program is finished, this rendered
 image will be automatically opened (saved in the subdirectory ``images/`` of the same
 level directory of ``start.py`` by default):
 
-.. image:: ../_static/quickstart/SquareToCircle.png
+.. image:: https://cdn.jsdelivr.net/gh/manim-kindergarten/CDN@master/manimgl_assets/quickstart/SquareToCircle.png
     :align: center
 
 Make an image
@@ -162,7 +169,7 @@ opened after the operation is over:
 
 .. raw:: html
 
-    <video class="manim-video" controls loop autoplay src="../_static/quickstart/SquareToCircle.mp4"></video>
+    <video class="manim-video" controls loop autoplay src="https://cdn.jsdelivr.net/gh/manim-kindergarten/CDN@master/manimgl_assets/quickstart/SquareToCircle.mp4"></video>
 
 Let's take a look at the code this time. The first 7 lines are the same as the previous
 ones, and the 8th line is similar to the 5th line, which creates an instance of the
@@ -237,7 +244,7 @@ You will get an animation similar to the following:
 
 .. raw:: html
 
-    <video class="manim-video" controls loop autoplay src="../_static/quickstart/SquareToCircleEmbed.mp4"></video>
+    <video class="manim-video" controls loop autoplay src="https://cdn.jsdelivr.net/gh/manim-kindergarten/CDN@master/manimgl_assets/quickstart/SquareToCircleEmbed.mp4"></video>
 
 If you want to enter the interactive mode directly, you don't have to write an
 empty scene containing only ``self.embed()``, you can directly run the following command
@@ -253,4 +260,3 @@ You succeeded!
 After reading the above content, you already know how to use manim.
 Below you can see some examples, in the :doc:`example_scenes` page.
 But before that, you'd better have a look at the :doc:`configuration` of manim.
-
